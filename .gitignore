@@ -1,0 +1,12 @@
+# MkDocs build
+site/
+
+# Python (pokud používáš backend v Pythonu)
+__pycache__/
+*.pyc
+
+# Node (pokud máš frontend)
+node_modules/
+
+# env soubory
+.env

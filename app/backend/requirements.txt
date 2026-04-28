@@ -1,0 +1,17 @@
+apt install pkg-config libvirt-dev python3-dev build-essential
+
+pip install "fastapi[standard]" -- FastApi
+pip install asyncssh -- SSH 
+pip install passlib==1.7.4 bcrypt==4.0.1 -- Encrypting
+pip install SQLAlchemy -- ORM, DB
+pip install python-jose -- JWT
+pip install python-dotenv -- environment variables
+
+pip install requests -- Proxmox
+pip install apscheduler -- Scheduler
+pip install pyvmomi -- Esxi
+pip install libvirt-python -- KVM
+
+
+
+npm install @xterm/xterm

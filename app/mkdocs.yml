@@ -1,0 +1,74 @@
+site_name: Hypervisor Manager
+
+use_directory_urls: false
+
+theme:
+  name: material
+  features:
+    - content.code.copy
+
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          paths: [backend]
+          options:
+            docstring_style: google
+            separate_signature: true
+            show_signature_annotations: false
+            line_length: 60
+            members_order: source
+
+markdown_extensions:
+  - toc:
+      permalink: true
+      toc_depth: 3
+  - pymdownx.superfences
+
+nav:
+  - Home: index.md
+
+  - Uživatelská dokumentace:
+      - Přehled: user/index.md
+      - Servery: user/servers.md
+      - Uzly: user/nodes.md
+      - Virtuální stroje: user/vms.md
+      - Konzole: user/cli.md
+
+  - Vývojářská dokumentace:
+      - Přehled: developer/index.md
+
+      - Frontend:
+        - Přehled: developer/frontend/index.md
+        - Stránky: developer/frontend/pages.md
+        - Komponenty: developer/frontend/components.md
+        - Services: developer/frontend/services.md
+        - Konfigurace: developer/frontend/configuration.md
+
+      - Backend:
+          - Přehled: developer/backend/index.md
+          - Spuštění: developer/backend/startup.md
+          - Konfigurace: developer/backend/configuration.md
+          - Database: developer/backend/database.md
+          - Security: developer/backend/security.md
+          - Sessions: developer/backend/sessions.md
+          - API: developer/backend/api.md
+          - CLI: developer/backend/cli.md
+
+
+          - Platforms:
+              - Base: developer/backend/platforms/base.md
+              - Proxmox: developer/backend/platforms/proxmox.md
+              - ESXi: developer/backend/platforms/esxi.md
+              - KVM: developer/backend/platforms/kvm.md
+              - Xen: developer/backend/platforms/xen.md
+
+          - Services:
+              - Automation executor: developer/backend/services/automation_executor.md
+              - Automation service: developer/backend/services/automation_service.md
+              - Node service: developer/backend/services/node_service.md
+              - Scheduler: developer/backend/services/scheduler.md
+              - Server service: developer/backend/services/server_service.md
+              - User service: developer/backend/services/user_service.md
+              - VM service: developer/backend/services/vm_service.md
