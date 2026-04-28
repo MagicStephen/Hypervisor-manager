@@ -1,12 +1,17 @@
 # MkDocs build
 site/
+app/site/
 
-# Python (pokud používáš backend v Pythonu)
+# Python
 __pycache__/
 *.pyc
 
-# Node (pokud máš frontend)
+# Node
 node_modules/
 
-# env soubory
+# env
 .env
+
+# OS bordel
+.DS_Store
+Thumbs.db
