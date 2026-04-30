@@ -2019,6 +2019,8 @@ class KvmVmApi(BaseVmApi):
         """.strip()
     
     def _create_vm_base(self, node_id, opt_params: dict, source: dict | None):
+        iso_path = None
+        
         vm_config = self._parse_vm_config(opt_params)
 
         if not vm_config["disks"]:

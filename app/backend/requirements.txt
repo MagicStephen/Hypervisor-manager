@@ -11,7 +11,3 @@ pip install requests -- Proxmox
 pip install apscheduler -- Scheduler
 pip install pyvmomi -- Esxi
 pip install libvirt-python -- KVM
-
-
-
-npm install @xterm/xterm

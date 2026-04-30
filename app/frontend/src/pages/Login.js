@@ -18,7 +18,6 @@ function Login({ setIsAuthenticated }) {
 
     login(username, password)
       .then((data) => {
-        console.log(data);
 
         setIsAuthenticated(true);
         navigate('/servers');

@@ -177,8 +177,6 @@ export async function fetchVmConfiguration(serverId, nodeId, vmId) {
 
   const result = await res.json();
 
-  console.log(result);
-
   if (!res.ok) {
     const error = new Error(result?.detail || result?.message || 'VM config fetch failed');
     error.result = result;

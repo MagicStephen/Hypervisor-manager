@@ -22,7 +22,6 @@ function VmConsole({ selectedItem, preferredProtocol = 'vnc' }) {
       protocol
     );
 
-    console.log(result);
 
     return result;
   }

@@ -53,8 +53,6 @@ function VmLogs({ selectedItem, limit = 1000 }) {
           limit
         );
 
-        console.log('VM logs result:', result);
-
         if (!isMounted) return;
 
         setLines(Array.isArray(result?.lines) ? result.lines : []);

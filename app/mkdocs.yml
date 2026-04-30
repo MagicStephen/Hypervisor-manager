@@ -41,6 +41,7 @@ nav:
 
       - Frontend:
         - Přehled: developer/frontend/index.md
+        - Spuštění: developer/frontend/startup.md
         - Stránky: developer/frontend/pages.md
         - Komponenty: developer/frontend/components.md
         - Services: developer/frontend/services.md

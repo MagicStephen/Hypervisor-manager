@@ -10,6 +10,8 @@ import shutil
 import re
 from config import BACKUP_ROOT
 import tempfile
+import threading
+from urllib.parse import urlparse
 
 VMX_PATTERN = re.compile(r'/vmfs/volumes/.+?/(?P<vmname>[^/]+)/[^ ]+\.vmx')
 OPID_PATTERN = re.compile(r'opID=([a-zA-Z0-9\-]+)')
@@ -37,7 +39,7 @@ class EsxiVmApi(BaseVmApi):
             Struktura popisující capabilities.
         """
         return {
-            "source_types": ["empty", "iso", "backup"],
+            "source_types": ["empty", "iso"],
 
             "guest": {
                 "types": ["linux24", "linux", "windows-modern", "windows-latest", "other32", "other64"],
@@ -92,6 +94,7 @@ class EsxiVmApi(BaseVmApi):
             ValueError: Neplatné parametry nebo nenalezený host/datastore.
             RuntimeError: Selhání při vytváření VM.
         """
+        
         def create_vm_from_backup(
             source: dict,
             opt_params: dict,
@@ -99,23 +102,19 @@ class EsxiVmApi(BaseVmApi):
             resource_pool: vim.ResourcePool,
             vm_folder: vim.Folder,
         ):
-            
-            import pprint
 
-            pprint.pprint(opt_params)
-            
             rel_path = source.get("path")
             if not rel_path:
                 raise ValueError("Backup requires source.path")
 
-            backup_path = os.path.normpath(os.path.join(BACKUP_ROOT, rel_path))
-
-            if not os.path.isdir(backup_path):
-                raise ValueError(f"ESXi folder backup does not exist: {backup_path}")
+            backup_path = os.path.normpath(os.path.join(BACKUP_ROOT, "esxi", rel_path))
 
             vm_name = opt_params.get("name") or source.get("name")
             if not vm_name:
                 raise ValueError("Imported VM requires name")
+
+            if not os.path.isfile(backup_path) or not backup_path.endswith(".ova"):
+                raise ValueError(f"OVA backup does not exist: {backup_path}")
 
             host_datastores = list(getattr(host, "datastore", []) or [])
             if not host_datastores:
@@ -125,77 +124,157 @@ class EsxiVmApi(BaseVmApi):
                 (ds for ds in host_datastores if ds.name.lower() == "local"),
                 host_datastores[0],
             )
-            datastore_name = datastore.name
 
-            esxi_host = self.conn.host.replace("https://", "").replace("http://", "").rstrip("/")
-            session_cookie = self.conn.si._stub.cookie
+            raw_cookie = self.conn.si._stub.cookie
+
+            match = re.search(r'vmware_soap_session="([^"]+)"', raw_cookie)
+            if not match:
+                raise ValueError(f"Cannot parse session cookie: {raw_cookie}")
+
+            session_id = match.group(1)
 
             session = requests.Session()
             session.verify = False
-            session.headers.update({"Cookie": session_cookie})
+            session.headers.update({
+                "Cookie": f"vmware_soap_session={session_id}",
+            })
 
-            target_folder = vm_name
+            tmp_dir = tempfile.mkdtemp()
 
-            # 1) upload všech souborů backup složky do datastore
-            for file_name in os.listdir(backup_path):
-                local_file = os.path.join(backup_path, file_name)
+            try:
+                with tarfile.open(backup_path, "r") as tar:
+                    tar.extractall(tmp_dir)
 
-                if not os.path.isfile(local_file):
-                    continue
+                files = os.listdir(tmp_dir)
 
-                remote_path = f"{target_folder}/{file_name}"
+                ovf_files = [f for f in files if f.lower().endswith(".ovf")]
+                if not ovf_files:
+                    raise ValueError("OVA does not contain .ovf descriptor")
 
-                upload_url = (
-                    f"https://{esxi_host}/folder/{remote_path}"
-                    f"?dcPath=ha-datacenter&dsName={datastore_name}"
+                ovf_name = ovf_files[0]
+                ovf_path = os.path.join(tmp_dir, ovf_name)
+
+                with open(ovf_path, "r", encoding="utf-8") as f:
+                    ovf_descriptor = f.read()
+
+                ovf_manager = self.conn.si.content.ovfManager
+
+                import_params = vim.OvfManager.CreateImportSpecParams()
+                import_params.entityName = vm_name
+                import_params.diskProvisioning = "thin"
+
+                import_spec_result = ovf_manager.CreateImportSpec(
+                    ovfDescriptor=ovf_descriptor,
+                    resourcePool=resource_pool,
+                    datastore=datastore,
+                    cisp=import_params,
                 )
 
-                with open(local_file, "rb") as f:
-                    response = session.put(
-                        upload_url,
-                        data=f,
-                        headers={"Content-Length": str(os.path.getsize(local_file))},
-                        timeout=(30, 600),
-                    )
-                    response.raise_for_status()
+                if import_spec_result.error:
+                    raise RuntimeError(f"CreateImportSpec failed: {import_spec_result.error}")
 
-            # 2) najít VMX soubor
-            vmx_files = [
-                f for f in os.listdir(backup_path)
-                if f.lower().endswith(".vmx")
-            ]
+                lease = resource_pool.ImportVApp(
+                    spec=import_spec_result.importSpec,
+                    folder=vm_folder,
+                    host=host,
+                )
 
-            if not vmx_files:
-                raise ValueError("Backup folder does not contain .vmx file")
+                start = time.time()
+                while lease.state == vim.HttpNfcLease.State.initializing:
+                    if time.time() - start > 120:
+                        raise RuntimeError("Timeout waiting for import lease")
+                    time.sleep(1)
 
-            vmx_name = vmx_files[0]
-            datastore_vmx_path = f"[{datastore_name}] {target_folder}/{vmx_name}"
+                if lease.state != vim.HttpNfcLease.State.ready:
+                    raise RuntimeError(f"Import lease not ready: {lease.state}")
 
-            # 3) register VM
-            task = vm_folder.RegisterVM_Task(
-                path=datastore_vmx_path,
-                name=vm_name,
-                asTemplate=False,
-                pool=resource_pool,
-                host=host,
-            )
-            WaitForTask(task)
+                try:
+                    device_urls = list(getattr(lease.info, "deviceUrl", []) or [])
 
-            vm = self.conn.get_entity_by_name(vm_name, vim.VirtualMachine)
+                    if not device_urls:
+                        raise RuntimeError("Import lease has no device URLs")
 
-            options = opt_params.get("options", {})
-            if vm and options.get("start_after_create"):
-                power_task = vm.PowerOnVM_Task()
-                WaitForTask(power_task)
+                    for device in device_urls:
+                        upload_url = device.url
 
-            return {
-                "success": True,
-                "data": {
-                    "vmid": getattr(vm, "_moId", None) if vm else None,
-                    "name": vm_name,
-                    "status": "imported",
+                        if "://*/" in upload_url:
+                            upload_url = upload_url.replace("://*/", f"://{self.conn.host}/", 1)
+
+                        matching_item = next(
+                            (item for item in import_spec_result.fileItem if item.deviceId == device.importKey),
+                            None,
+                        )
+
+                        if not matching_item:
+                            raise ValueError(f"Cannot map importKey={device.importKey}")
+
+                        local_file = os.path.join(tmp_dir, matching_item.path)
+
+                        if not os.path.exists(local_file):
+                            raise ValueError(f"Missing upload file: {local_file}")
+
+                        file_size = os.path.getsize(local_file)
+
+                        if local_file.lower().endswith(".vmdk"):
+                            content_type = "application/x-vnd.vmware-streamVmdk"
+                        else:
+                            content_type = "application/octet-stream"
+
+                        lease.HttpNfcLeaseProgress(1)
+
+                        with open(local_file, "rb") as f:
+                            response = session.post(
+                                upload_url,
+                                data=f,
+                                headers={
+                                    "Content-Type": content_type,
+                                    "Content-Length": str(file_size),
+                                },
+                                timeout=(30, 1200),
+                                allow_redirects=False,
+                            )
+
+                        response.raise_for_status()
+
+                        lease.HttpNfcLeaseProgress(95)
+
+                    lease.HttpNfcLeaseProgress(100)
+                    lease.HttpNfcLeaseComplete()
+
+                except Exception:
+                    try:
+                        lease.HttpNfcLeaseAbort(vim.fault.RequestCanceled())
+                    except Exception:
+                        pass
+
+                    try:
+                        created_vm = self.conn.get_entity_by_name(vm_name, vim.VirtualMachine)
+                        if created_vm:
+                            task = created_vm.Destroy_Task()
+                            WaitForTask(task)
+                    except Exception:
+                        pass
+
+                    raise
+
+                vm = self.conn.get_entity_by_name(vm_name, vim.VirtualMachine)
+
+                options = opt_params.get("options", {})
+                if vm and options.get("start_after_create"):
+                    task = vm.PowerOnVM_Task()
+                    WaitForTask(task)
+
+                return {
+                    "success": True,
+                    "data": {
+                        "vmid": getattr(vm, "_moId", None) if vm else None,
+                        "name": vm_name,
+                        "status": "imported",
+                    }
                 }
-            }
+
+            finally:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
 
         def create_vm_from_scratch(
             source: dict,
@@ -1438,31 +1517,18 @@ class EsxiVmApi(BaseVmApi):
         """
 
         vm = self.conn.get_entity_by_moid(vm_id, vim.VirtualMachine)
+
         if not vm:
             raise ValueError(f"VM '{vm_id}' not found")
 
         vm_name = getattr(vm, "name", vm_id)
         power_state = getattr(getattr(vm, "runtime", None), "powerState", None)
 
-        if power_state == vim.VirtualMachinePowerState.poweredOn:
-            raise ValueError("VM must be powered off for ESXi folder backup")
+        if power_state != vim.VirtualMachinePowerState.poweredOff:
+            raise ValueError(f"VM must be powered off for OVF/OVA export, current state: {power_state}")
 
-        vmx_path = vm.config.files.vmPathName
-        # např. "[local] VMTEST2/VMTEST2.vmx"
-
-        if not vmx_path or not vmx_path.startswith("["):
-            raise ValueError(f"Invalid VM path: {vmx_path}")
-
-        datastore_name = vmx_path.split("]")[0].strip("[")
-        relative_vmx_path = vmx_path.split("]", 1)[1].strip()
-        vm_folder = relative_vmx_path.rsplit("/", 1)[0]
-
-        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
-
-        backup_dir = os.path.join(backup_root, "esxi", vm_id, f"{vm_id}_{timestamp}")
-        tmp_backup_dir = backup_dir + ".part"
-
-        os.makedirs(os.path.dirname(backup_dir), exist_ok=True)
+        if vm.snapshot is not None:
+            raise ValueError("VM has snapshots. Remove/consolidate snapshots before OVF/OVA export.")
 
         session_cookie = self.conn.si._stub.cookie
         if not session_cookie:
@@ -1470,60 +1536,82 @@ class EsxiVmApi(BaseVmApi):
 
         esxi_host = self.conn.host.replace("https://", "").replace("http://", "").rstrip("/")
 
+        safe_name = "".join(c if c.isalnum() or c in "._-" else "_" for c in vm_name)
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
+
+        backup_dir = os.path.join(backup_root, "esxi", vm_id, f"{safe_name}_{timestamp}")
+        tmp_backup_dir = backup_dir + ".part"
+
+        ova_path = backup_dir + ".ova"
+        tmp_ova_path = ova_path + ".part"
+
+        os.makedirs(os.path.dirname(backup_dir), exist_ok=True)
+
+        raw_cookie = self.conn.si._stub.cookie
+        if not raw_cookie:
+            raise ValueError("Missing ESXi session cookie")
+
+        match = re.search(r'vmware_soap_session="([^"]+)"', raw_cookie)
+        if not match:
+            match = re.search(r'"([^"]+)"', raw_cookie)
+
+        if not match:
+            raise ValueError(f"Cannot parse ESXi session cookie: {raw_cookie}")
+
+        session_id = match.group(1)
+
         session = requests.Session()
         session.verify = False
         session.headers.update({
-            "Cookie": session_cookie,
+            "Cookie": f'vmware_soap_session="{session_id}"',
         })
 
-        def list_datastore_files(folder_path: str) -> list[str]:
-            search_spec = vim.HostDatastoreBrowserSearchSpec()
-            search_spec.matchPattern = ["*"]
-
-            task = datastore.browser.SearchDatastore_Task(
-                datastorePath=f"[{datastore_name}] {folder_path}",
-                searchSpec=search_spec,
-            )
-
-            WaitForTask(task)
-
-            result = task.info.result
-            files = []
-
-            for item in result.file:
-                files.append(item.path)
-
-            return files
-
-        datastore = None
-        for ds in getattr(vm.runtime.host, "datastore", []) or []:
-            if ds.name == datastore_name:
-                datastore = ds
-                break
-
-        if datastore is None:
-            raise ValueError(f"Datastore '{datastore_name}' not found on host")
+        lease = None
+        stop_keepalive = False
 
         try:
             os.makedirs(tmp_backup_dir, exist_ok=True)
 
-            files = list_datastore_files(vm_folder)
+            lease = vm.ExportVm()
 
-            if not files:
-                raise RuntimeError(f"No files found in datastore folder: [{datastore_name}] {vm_folder}")
+            start = time.time()
+            while lease.state != vim.HttpNfcLease.State.ready:
+                if lease.state == vim.HttpNfcLease.State.error:
+                    raise RuntimeError(f"Export lease failed: {lease.error}")
 
-            for file_name in files:
-                # snapshot lock soubory neber
-                if file_name.endswith(".lck"):
-                    continue
+                if time.time() - start > 120:
+                    raise RuntimeError("Timeout waiting for export lease")
 
-                remote_path = f"{vm_folder}/{file_name}"
+                time.sleep(1)
+
+            def keepalive():
+                nonlocal stop_keepalive
+                while not stop_keepalive:
+                    try:
+                        lease.HttpNfcLeaseProgress(50)
+                    except Exception:
+                        pass
+                    time.sleep(5)
+
+            keepalive_thread = threading.Thread(target=keepalive, daemon=True)
+            keepalive_thread.start()
+
+            downloaded_files = []
+            ovf_files = []
+
+            for device in lease.info.deviceUrl:
+                url = device.url
+
+                if "://*/" in url:
+                    url = url.replace("://*/", f"://{esxi_host}/", 1)
+
+                parsed = urlparse(url)
+                file_name = os.path.basename(parsed.path)
+
+                if not file_name:
+                    file_name = f"disk-{device.key}.vmdk"
+
                 local_path = os.path.join(tmp_backup_dir, file_name)
-
-                url = (
-                    f"https://{esxi_host}/folder/{remote_path}"
-                    f"?dcPath=ha-datacenter&dsName={datastore_name}"
-                )
 
                 with session.get(url, stream=True, timeout=(30, 600)) as response:
                     response.raise_for_status()
@@ -1533,23 +1621,78 @@ class EsxiVmApi(BaseVmApi):
                             if chunk:
                                 f.write(chunk)
 
+                file_size = os.path.getsize(local_path)
+
+                downloaded_files.append(local_path)
+                ovf_files.append(
+                    vim.OvfManager.OvfFile(
+                        deviceId=str(device.key),
+                        path=file_name,
+                        size=file_size,
+                    )
+                )
+
+            ovf_manager = self.conn.si.content.ovfManager
+
+            create_spec = vim.OvfManager.CreateDescriptorParams()
+            create_spec.name = vm_name
+            create_spec.ovfFiles = ovf_files
+
+            ovf_result = ovf_manager.CreateDescriptor(
+                obj=vm,
+                cdp=create_spec,
+            )
+
+            if getattr(ovf_result, "error", None):
+                raise RuntimeError(f"Failed to create OVF descriptor: {ovf_result.error}")
+
+            ovf_path = os.path.join(tmp_backup_dir, f"{safe_name}.ovf")
+
+            with open(ovf_path, "w", encoding="utf-8") as f:
+                f.write(ovf_result.ovfDescriptor)
+
+            # OVA je obyčejný tar archiv. OVF musí být první.
+            with tarfile.open(tmp_ova_path, "w") as tar:
+                tar.add(ovf_path, arcname=os.path.basename(ovf_path))
+
+                for local_file in downloaded_files:
+                    tar.add(local_file, arcname=os.path.basename(local_file))
+
+            stop_keepalive = True
+
+            try:
+                lease.HttpNfcLeaseComplete()
+            except Exception:
+                pass
+
             os.rename(tmp_backup_dir, backup_dir)
+            os.rename(tmp_ova_path, ova_path)
 
             return {
                 "vm_id": vm_id,
                 "name": vm_name,
-                "path": backup_dir,
-                "format": "esxi-folder",
+                "path": ova_path,
+                "workdir": backup_dir,
+                "format": "ova",
                 "status": "completed",
-                "datastore": datastore_name,
-                "vm_folder": vm_folder,
             }
 
         except Exception as e:
+            stop_keepalive = True
+
+            if lease is not None:
+                try:
+                    lease.HttpNfcLeaseAbort(vim.fault.RequestCanceled())
+                except Exception:
+                    pass
+
             if os.path.exists(tmp_backup_dir):
                 shutil.rmtree(tmp_backup_dir, ignore_errors=True)
 
-            raise RuntimeError(f"Failed to create ESXi folder backup for VM '{vm_id}': {e}")
+            if os.path.exists(tmp_ova_path):
+                os.remove(tmp_ova_path)
+
+            raise RuntimeError(f"Failed to create OVA backup for VM '{vm_id}': {e}")
 
     def set_vm_config(self, node: str, vmid: str, optional_params: dict) -> dict:
         """
@@ -1785,6 +1928,29 @@ class EsxiVmApi(BaseVmApi):
             changed = True
 
         # 6) CDROMS
+        
+        requested_cdroms = optional_params.get("cdroms", []) or []
+        requested_slots = {
+            cdrom.get("slot")
+            for cdrom in requested_cdroms
+            if cdrom.get("slot")
+        }
+
+        # remove CD-ROMs not requested anymore
+        for dev in vm.config.hardware.device:
+            if not isinstance(dev, vim.vm.device.VirtualCdrom):
+                continue
+
+            existing_slot = f"ide{dev.unitNumber}"  # např. "ide0", "ide1"
+
+            if existing_slot not in requested_slots:
+                cd_spec = vim.vm.device.VirtualDeviceSpec()
+                cd_spec.operation = vim.vm.device.VirtualDeviceSpec.Operation.remove
+                cd_spec.device = dev
+
+                device_changes.append(cd_spec)
+                changed = True
+                
         for cdrom in optional_params.get("cdroms", []) or []:
             slot = cdrom.get("slot")
             if not slot:
